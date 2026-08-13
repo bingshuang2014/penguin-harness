@@ -99,6 +99,29 @@ export interface CompactionSettings {
   mode: CompactionMode;
   /** Prompt used for summarize compaction. */
   prompt: string;
+
+  /**
+   * Recent tokens to preserve (not summarized). Default 20000.
+   * When > 0, compaction walks backwards from the newest message, accumulating token
+   * estimates until this threshold is reached, then cuts at a valid turn boundary.
+   * Set to 0 to disable (summarize all messages).
+   */
+  keepRecentTokens?: number;
+
+  /**
+   * Tokens to reserve for the LLM response. Default 16384 (~13% of 128k context).
+   * Compaction triggers when contextTokens > contextWindow - reserveTokens,
+   * preventing consecutive compaction triggers.
+   * Set to 0 to disable (trigger at exact threshold).
+   */
+  reserveTokens?: number;
+
+  /**
+   * Update prompt for incremental summarization. When a previous summary exists,
+   * this prompt is used to merge new information into the existing summary
+   * instead of regenerating from scratch.
+   */
+  updatePrompt?: string;
 }
 
 /** Result of one compaction run: status is a terminal state (completed / failed / aborted); carries the summary message when summarize succeeds. */
@@ -259,6 +282,62 @@ export const SUMMARY_RETRY_GUIDANCE =
   "Your previous reply was not a usable summary. Reply again with text only, no tool " +
   "calls, in exactly this format and nothing after it:\n\n" +
   "[summary]put the summary text here...[/summary]";
+
+/**
+ * Structured 6-section summary prompt (inspired by PI).
+ * Ensures key information is not lost during compaction.
+ */
+export const STRUCTURED_SUMMARIZATION_PROMPT = `Summarize the conversation transcript above into a structured format.
+The summary will replace the transcript as its only record, so include everything needed to continue the task.
+
+Use this exact format:
+
+## Goal
+[What the user is trying to accomplish]
+
+## Constraints & Preferences
+- [Requirements mentioned by user]
+
+## Progress
+### Done
+- [x] [Completed tasks]
+
+### In Progress
+- [ ] [Current work]
+
+## Key Decisions
+- **[Decision]**: [Rationale]
+
+## Next Steps
+1. [What should happen next]
+
+## Critical Context
+- [Data, file paths, function names, error messages needed to continue]
+
+Do not call any tools; reply with text only, in exactly this format and nothing after it:
+
+[summary]put the summary text here...[/summary]`;
+
+/**
+ * Update prompt for incremental summarization.
+ * When a previous summary exists, this prompt merges new information into it
+ * instead of regenerating from scratch.
+ */
+export const UPDATE_SUMMARIZATION_PROMPT = `You are updating an existing summary of a conversation.
+
+Previous Summary:
+{previousSummary}
+
+New Messages Since Last Summary:
+{newMessages}
+
+Update the summary to incorporate the new information. Keep the same structured format.
+Preserve exact file paths, function names, error messages from the new messages.
+Only include information that is actually present in the conversation.
+
+Do not call any tools; reply with text only, in exactly this format and nothing after it:
+
+[summary]put the updated summary text here...[/summary]`;
 
 /** Result of executing one LLM turn (the return value of runTurn). */
 interface TurnResult {
@@ -1233,7 +1312,10 @@ export class ContextEngine {
   private compactionTrigger(): CompactionReason | null {
     const settings = this.deps.compaction;
     if (!settings || !this.deps.createLLM) return null;
-    if (settings.maxContextLength > 0 && this.lastRequestTotal >= settings.maxContextLength) {
+
+    const reserveTokens = settings.reserveTokens ?? 0;
+
+    if (settings.maxContextLength > 0 && this.lastRequestTotal >= settings.maxContextLength - reserveTokens) {
       return "context";
     }
     if (settings.maxSessionTurns > 0 && this.sessionTurns >= settings.maxSessionTurns) {
@@ -1250,6 +1332,183 @@ export class ContextEngine {
     if (payload.request) this.lastRequestTotal = payload.request.total;
     if (payload.session) this.lastSessionTokens = payload.session;
     return true;
+  }
+
+  /** @internal Estimates token count for a message using chars/4 approximation. */
+  estimateTokens(msg: OmniMessage): number {
+    let text = "";
+    if (msg.type === "model_msg") {
+      const payload = msg.payload as TextPayload | ThinkingPayload | ToolCallPayload | ToolCallOutputPayload;
+      if (payload.type === "text") {
+        text = payload.text ?? "";
+      } else if (payload.type === "thinking") {
+        text = payload.thinking ?? "";
+      } else if (payload.type === "tool_call") {
+        text = typeof payload.arguments === "string" ? payload.arguments : JSON.stringify(payload.arguments ?? {});
+      } else if (payload.type === "tool_call_output") {
+        text = payload.output ?? "";
+      }
+    } else if (msg.type === "session_meta") {
+      const payload = msg.payload as TextPayload;
+      if (payload.type === "text") {
+        text = payload.text ?? "";
+      }
+    }
+    return Math.ceil(text.length / 4);
+  }
+
+  /**
+   * Finds a valid cut point for compaction, walking backwards from the newest message.
+   * Stops when accumulated tokens reach keepRecentTokens, then adjusts to a valid
+   * turn boundary (user message or assistant message without pending tool results).
+   */
+  findCutPoint(messages: OmniMessage[], keepRecentTokens: number): number {
+    if (keepRecentTokens <= 0 || messages.length === 0) return 0;
+
+    let accumulatedTokens = 0;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      accumulatedTokens += this.estimateTokens(messages[i]!);
+      if (accumulatedTokens >= keepRecentTokens) {
+        return this.findValidCutPoint(messages, i);
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Adjusts a raw cut index to a valid turn boundary.
+   * Valid boundaries are: user messages, or the start of a turn (after a user message).
+   * For split turns (tool_call without matching tool_call_output), returns the
+   * user message that started the turn, so the split turn prefix can be summarized separately.
+   */
+  findValidCutPoint(messages: OmniMessage[], rawCutIndex: number): number {
+    for (let i = rawCutIndex; i >= 0; i--) {
+      const msg = messages[i]!;
+      if (msg.type === "model_msg" && (msg.payload as TextPayload).role === "user") {
+        return i;
+      }
+      if (msg.type === "model_msg") {
+        const payload = msg.payload as ToolCallPayload;
+        if (payload.type === "tool_call") {
+          const hasResult = messages.slice(i + 1).some(
+            (m) =>
+              m.type === "model_msg" &&
+              (m.payload as ToolCallOutputPayload).type === "tool_call_output" &&
+              (m.payload as ToolCallOutputPayload).tool_call_id === payload.tool_call_id,
+          );
+          if (!hasResult) continue;
+        }
+        return i;
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Detects split turns in the messages array. A split turn is when a tool_call
+   * has no matching tool_call_output within the messages to summarize.
+   * Returns the split turn boundary index if found, or -1 if no split turns.
+   */
+  detectSplitTurn(messages: OmniMessage[]): number {
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i]!;
+      if (msg.type === "model_msg") {
+        const payload = msg.payload as ToolCallPayload;
+        if (payload.type === "tool_call") {
+          const hasResult = messages.slice(i + 1).some(
+            (m) =>
+              m.type === "model_msg" &&
+              (m.payload as ToolCallOutputPayload).type === "tool_call_output" &&
+              (m.payload as ToolCallOutputPayload).tool_call_id === payload.tool_call_id,
+          );
+          if (!hasResult) {
+            return i;
+          }
+        }
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * Summarizes the turn prefix for a split turn. The split turn is when a tool_call
+   * has no matching tool_call_output within the messages to summarize.
+   * This function summarizes just the turn prefix (from user message to the split point)
+   * separately, then the remaining messages are summarized with the prefix summary included.
+   */
+  private async *summarizeSplitTurn(
+    messages: OmniMessage[],
+    splitIndex: number,
+  ): AsyncGenerator<OmniMessage, string> {
+    const turnPrefix = messages.slice(0, splitIndex);
+    const text = this.extractTextFromMessages(turnPrefix);
+
+    const summaryPrompt = userText(
+      `Summarize this conversation turn prefix (from a split turn where tool results are pending):\n\n${text}`,
+    );
+    yield summaryPrompt;
+
+    const attempt = await this.runCompactionRequest([summaryPrompt]);
+    if (attempt.status === "completed") {
+      return extractSummary(attempt.text);
+    }
+    return text.slice(0, 200) + "...";
+  }
+
+  /**
+   * Extracts text content from messages for summarization.
+   */
+  extractTextFromMessages(messages: OmniMessage[]): string {
+    return messages
+      .map((msg) => {
+        if (msg.type === "model_msg") {
+          const payload = msg.payload as TextPayload | ThinkingPayload | ToolCallPayload | ToolCallOutputPayload;
+          if (payload.type === "text") {
+            return payload.text ?? "";
+          }
+          if (payload.type === "thinking") {
+            return payload.thinking ?? "";
+          }
+          if (payload.type === "tool_call") {
+            return `[Tool Call: ${payload.name}(${payload.arguments ?? ""})]`;
+          }
+          if (payload.type === "tool_call_output") {
+            return `[Tool Output: ${payload.output ?? ""}]`;
+          }
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  /**
+   * Extracts file operations from messages for context tracking.
+   */
+  extractFileOperations(messages: OmniMessage[]): { readFiles: string[]; modifiedFiles: string[] } {
+    const readFiles: string[] = [];
+    const modifiedFiles: string[] = [];
+
+    for (const msg of messages) {
+      if (msg.type === "model_msg") {
+        const payload = msg.payload as ToolCallPayload;
+        if (payload.type === "tool_call") {
+          const argsRaw = payload.arguments;
+          const args = typeof argsRaw === "string" ? JSON.parse(argsRaw) as Record<string, unknown> : (argsRaw as unknown as Record<string, unknown>);
+          if (payload.name === "read" && args?.filePath) {
+            readFiles.push(args.filePath as string);
+          }
+          if ((payload.name === "write" || payload.name === "edit") && args?.filePath) {
+            modifiedFiles.push(args.filePath as string);
+          }
+        }
+      }
+    }
+
+    return {
+      readFiles: [...new Set(readFiles)],
+      modifiedFiles: [...new Set(modifiedFiles)],
+    };
   }
 
   /**
@@ -1299,15 +1558,23 @@ export class ContextEngine {
     const settings = this.deps.compaction!;
     yield* this.emitCompactionBegin(reason, "summarize");
 
-    // Compaction request input: this turn's tool results (mid-Task) or leftover interruption
-    // carry-over, plus the compaction Prompt. The compaction exchange is written to the old
-    // Trace (traceable but not pushed to the user); tool results were already written when
-    // executed and aren't recorded again, while carry-over's not-yet-written synthetic content
-    // (flatten text, backfilled placeholders) and the compaction Prompt are written now.
-    const prompt = userText(settings.prompt);
-    // The resend base: shrinks to the Prompt alone once an attempt commits — the folded turn
-    // input then lives in the old LLM object's history, and resending it would make strict
-    // providers reject the request over duplicate/stale tool_results (issue #85).
+    const keepRecentTokens = settings.keepRecentTokens ?? 20000;
+    const hasPreviousSummary = this.pendingSummary !== null;
+    const useStructuredPrompt = settings.keepRecentTokens != null && settings.keepRecentTokens > 0;
+
+    let prompt: OmniMessage;
+    if (hasPreviousSummary && settings.updatePrompt) {
+      const previousSummaryText = extractSummary((this.pendingSummary!.payload as TextPayload).text);
+      prompt = userText(
+        settings.updatePrompt
+          .replace("{previousSummary}", previousSummaryText)
+          .replace("{newMessages}", pendingToolOutputs.length > 0 ? `${pendingToolOutputs.length} pending tool outputs` : "new conversation messages"),
+      );
+    } else if (useStructuredPrompt) {
+      prompt = userText(STRUCTURED_SUMMARIZATION_PROMPT);
+    } else {
+      prompt = userText(settings.prompt);
+    }
     let base = [...pendingToolOutputs, prompt];
     let input = base;
     await this.write(prompt);

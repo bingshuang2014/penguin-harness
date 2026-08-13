@@ -49,7 +49,7 @@ import type {
   LLMInterface,
   LLMOutcome,
 } from "../src/interfaces.js";
-import { ContextEngine, SUMMARY_RETRY_GUIDANCE } from "../src/engine/context-engine.js";
+import { ContextEngine, SUMMARY_RETRY_GUIDANCE, STRUCTURED_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT } from "../src/engine/context-engine.js";
 import type { CompactionSettings } from "../src/engine/context-engine.js";
 import { GenerativeModel } from "../src/llm/index.js";
 import type { UniConfig, UniEvent, UniMessage } from "@prismshadow/agenthub";
@@ -1596,7 +1596,263 @@ describe("context compaction", () => {
 
     const events = compactionEvents(out);
     expect(events[1]).toMatchObject({ type: "compaction_end", status: "aborted" });
-    // Interrupt cleanup: the tool output is held as carry-over per case A, and the run wraps up with an abort event.
     expect(payloadTypes(out)).toContain("abort");
+  });
+});
+
+describe("PI compaction improvements", () => {
+  let traces: string;
+
+  beforeEach(async () => {
+    traces = await mkdtemp(join(tmpdir(), "penguin-compaction-pi-"));
+  });
+
+  afterEach(async () => {
+    await rm(traces, { recursive: true, force: true });
+  });
+
+  const metaMessage = sessionMeta({
+    session_id: "sess_pi_compact",
+    provider: "custom",
+    model_id: "test-model",
+    model_context_window: 200000,
+    system_prompt: "sp",
+    agent_state: "/tmp/state",
+    workspace: "/tmp/ws",
+  });
+
+  function makeEngine(over: Partial<CompactionSettings> = {}): ContextEngine {
+    const llm = new ScriptedLLM([{ messages: [assistantText("ok"), usage(10, 10)] }]);
+    const trace = new Writer({ tracesDir: traces, sessionId: "sess_pi_compact" });
+    return new ContextEngine({
+      llm,
+      environment: fakeEnvironment,
+      trace,
+      sessionMeta: metaMessage,
+      compaction: settings({
+        keepRecentTokens: 20000,
+        reserveTokens: 16384,
+        ...over,
+      }),
+      createLLM: () => llm,
+    });
+  }
+
+  describe("estimateTokens", () => {
+    it("estimates text message tokens as chars/4", () => {
+      const engine = makeEngine();
+      const msg = userText("hello world");
+      expect(engine.estimateTokens(msg)).toBe(Math.ceil(11 / 4));
+    });
+
+    it("estimates thinking message tokens as chars/4", () => {
+      const engine = makeEngine();
+      const msg = thinkingMessage("long thinking text here");
+      expect(engine.estimateTokens(msg)).toBe(Math.ceil(22 / 4));
+    });
+
+    it("estimates tool_call tokens from serialized arguments", () => {
+      const engine = makeEngine();
+      const msg = toolCall({ name: "read", arguments: '{"filePath":"/tmp/test"}', toolCallId: "tc_1" });
+      expect(engine.estimateTokens(msg)).toBe(Math.ceil(JSON.stringify({ filePath: "/tmp/test" }).length / 4));
+    });
+
+    it("estimates tool_call_output tokens from output text", () => {
+      const engine = makeEngine();
+      const msg = toolCallOutput({ output: "file content here", toolCallId: "tc_1" });
+      expect(engine.estimateTokens(msg)).toBe(Math.ceil(17 / 4));
+    });
+
+    it("returns 0 for event_msg (non-model, non-user)", () => {
+      const engine = makeEngine();
+      const msg = tokenUsage({ cache_read: 0, cache_write: 0, output: 0, total: 100 }, { cache_read: 0, cache_write: 0, output: 0, total: 100 });
+      expect(engine.estimateTokens(msg)).toBe(0);
+    });
+  });
+
+  describe("findCutPoint", () => {
+    it("returns 0 when keepRecentTokens is 0", () => {
+      const engine = makeEngine();
+      const msgs = [userText("a"), assistantText("b"), userText("c"), assistantText("d")];
+      expect(engine.findCutPoint(msgs, 0)).toBe(0);
+    });
+
+    it("returns 0 when messages is empty", () => {
+      const engine = makeEngine();
+      expect(engine.findCutPoint([], 20000)).toBe(0);
+    });
+
+    it("returns 0 when total tokens < keepRecentTokens", () => {
+      const engine = makeEngine();
+      const msgs = [userText("hi")];
+      expect(engine.findCutPoint(msgs, 20000)).toBe(0);
+    });
+
+    it("cuts at user_msg boundary when enough tokens accumulated", () => {
+      const engine = makeEngine();
+      const longText = "x".repeat(100000);
+      const msgs = [
+        userText("old question"),
+        assistantText(longText),
+        userText("new question"),
+        assistantText("new answer"),
+      ];
+      const cutPoint = engine.findCutPoint(msgs, 20000);
+      expect(cutPoint).toBeGreaterThanOrEqual(0);
+      expect(cutPoint).toBeLessThanOrEqual(2);
+    });
+  });
+
+  describe("findValidCutPoint", () => {
+    it("returns the model_msg index when found at user_msg", () => {
+      const engine = makeEngine();
+      const msgs = [
+        userText("q1"),
+        assistantText("a1"),
+        userText("q2"),
+        assistantText("a2"),
+      ];
+      expect(engine.findValidCutPoint(msgs, 2)).toBe(2);
+    });
+
+    it("skips tool_call without result and finds earlier model_msg", () => {
+      const engine = makeEngine();
+      const msgs = [
+        userText("q1"),
+        assistantText("a1"),
+        toolCall({ name: "read", arguments: "{}", toolCallId: "tc_1" }),
+        assistantText("a2"),
+      ];
+      const cutPoint = engine.findValidCutPoint(msgs, 2);
+      expect(cutPoint).toBe(1);
+    });
+
+    it("returns model_msg index when tool_call has result", () => {
+      const engine = makeEngine();
+      const msgs = [
+        userText("q1"),
+        toolCall({ name: "read", arguments: "{}", toolCallId: "tc_1" }),
+        toolCallOutput({ output: "ok", toolCallId: "tc_1" }),
+        assistantText("a1"),
+      ];
+      expect(engine.findValidCutPoint(msgs, 3)).toBe(3);
+    });
+  });
+
+  describe("detectSplitTurn", () => {
+    it("returns -1 when no split turns exist", () => {
+      const engine = makeEngine();
+      const msgs = [
+        userText("q1"),
+        toolCall({ name: "read", arguments: "{}", toolCallId: "tc_1" }),
+        toolCallOutput({ output: "ok", toolCallId: "tc_1" }),
+        assistantText("a1"),
+      ];
+      expect(engine.detectSplitTurn(msgs)).toBe(-1);
+    });
+
+    it("returns index of tool_call without matching output", () => {
+      const engine = makeEngine();
+      const msgs = [
+        userText("q1"),
+        toolCall({ name: "read", arguments: "{}", toolCallId: "tc_1" }),
+        assistantText("a1"),
+      ];
+      expect(engine.detectSplitTurn(msgs)).toBe(1);
+    });
+
+    it("returns -1 for empty messages", () => {
+      const engine = makeEngine();
+      expect(engine.detectSplitTurn([])).toBe(-1);
+    });
+  });
+
+  describe("extractTextFromMessages", () => {
+    it("extracts text from user messages", () => {
+      const engine = makeEngine();
+      const msgs = [userText("hello"), assistantText("world")];
+      expect(engine.extractTextFromMessages(msgs)).toContain("hello");
+      expect(engine.extractTextFromMessages(msgs)).toContain("world");
+    });
+
+    it("formats tool calls as readable text", () => {
+      const engine = makeEngine();
+      const msgs = [toolCall({ name: "read", arguments: '{"filePath":"/tmp"}', toolCallId: "tc_1" })];
+      const text = engine.extractTextFromMessages(msgs);
+      expect(text).toContain("Tool Call");
+      expect(text).toContain("read");
+    });
+
+    it("formats tool outputs", () => {
+      const engine = makeEngine();
+      const msgs = [toolCallOutput({ output: "file content", toolCallId: "tc_1" })];
+      const text = engine.extractTextFromMessages(msgs);
+      expect(text).toContain("Tool Output");
+      expect(text).toContain("file content");
+    });
+  });
+
+  describe("extractFileOperations", () => {
+    it("tracks read file operations", () => {
+      const engine = makeEngine();
+      const msgs = [toolCall({ name: "read", arguments: '{"filePath":"/tmp/a.txt"}', toolCallId: "tc_1" })];
+      const ops = engine.extractFileOperations(msgs);
+      expect(ops.readFiles).toContain("/tmp/a.txt");
+      expect(ops.modifiedFiles).toHaveLength(0);
+    });
+
+    it("tracks write and edit file operations", () => {
+      const engine = makeEngine();
+      const msgs = [
+        toolCall({ name: "write", arguments: '{"filePath":"/tmp/out.txt"}', toolCallId: "tc_1" }),
+        toolCall({ name: "edit", arguments: '{"filePath":"/tmp/ed.txt"}', toolCallId: "tc_2" }),
+      ];
+      const ops = engine.extractFileOperations(msgs);
+      expect(ops.modifiedFiles).toContain("/tmp/out.txt");
+      expect(ops.modifiedFiles).toContain("/tmp/ed.txt");
+    });
+
+    it("deduplicates file paths", () => {
+      const engine = makeEngine();
+      const msgs = [
+        toolCall({ name: "read", arguments: '{"filePath":"/tmp/a.txt"}', toolCallId: "tc_1" }),
+        toolCall({ name: "read", arguments: '{"filePath":"/tmp/a.txt"}', toolCallId: "tc_2" }),
+      ];
+      const ops = engine.extractFileOperations(msgs);
+      expect(ops.readFiles.filter((f) => f === "/tmp/a.txt")).toHaveLength(1);
+    });
+  });
+
+  describe("compactionTrigger with reserveTokens", () => {
+    it("triggers when context usage exceeds maxContextLength - reserveTokens", () => {
+      const trace = new Writer({ tracesDir: traces, sessionId: "sess_reserve" });
+      const llm = new ScriptedLLM([]);
+      const engine = new ContextEngine({
+        llm,
+        environment: fakeEnvironment,
+        trace,
+        sessionMeta: metaMessage,
+        compaction: settings({ maxContextLength: 100, reserveTokens: 20 }),
+        createLLM: () => llm,
+      });
+      const reason = (engine as unknown as { compactionTrigger(): string | null }).compactionTrigger();
+      expect(reason).toBeNull();
+    });
+  });
+
+  describe("prompts", () => {
+    it("STRUCTURED_SUMMARIZATION_PROMPT contains 6 sections", () => {
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Goal");
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Constraints");
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Progress");
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Key Decisions");
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Next Steps");
+      expect(STRUCTURED_SUMMARIZATION_PROMPT).toContain("## Critical Context");
+    });
+
+    it("UPDATE_SUMMARIZATION_PROMPT has placeholder tokens", () => {
+      expect(UPDATE_SUMMARIZATION_PROMPT).toContain("{previousSummary}");
+      expect(UPDATE_SUMMARIZATION_PROMPT).toContain("{newMessages}");
+    });
   });
 });
