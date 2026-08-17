@@ -72,6 +72,55 @@ private estimateTokensFromText(text: string): number {
 }
 ```
 
+#### Bug 3: `pendingRecentMessages` 被内部覆盖
+
+**问题**：`summarizeContext` 内部再次调用 `findCutPoint` 并覆盖 `pendingRecentMessages`，导致外部设置的正确值被丢弃。
+
+**根因分析**：
+1. 外部设置 `this.pendingRecentMessages = attemptInput.slice(cutPoint)`（正确）
+2. `summarizeContext` 内部设置 `this.pendingRecentMessages = recentToKeep`（错误覆盖）
+3. `recentToKeep` 来自早期消息的切分，而不是完整上下文的切分
+
+**修复**：删除 `summarizeContext` 内部的覆盖逻辑，使用外部已正确设置的值。
+
+```typescript
+// 修复前：内部又计算了一次，覆盖了外部设置
+let recentToKeep: OmniMessage[] = [];
+if (useStructuredPrompt && keepRecentTokens > 0 && pendingToolOutputs.length > 0) {
+  const cutPoint = this.findCutPoint(pendingToolOutputs, keepRecentTokens);
+  if (cutPoint > 0 && cutPoint < pendingToolOutputs.length) {
+    recentToKeep = pendingToolOutputs.slice(cutPoint);  // ❌ 覆盖外部设置
+  }
+}
+this.pendingRecentMessages = recentToKeep;
+
+// 修复后：不覆盖，使用外部已设置的值
+// Don't overwrite pendingRecentMessages here - it's already correctly set
+// by the caller (external compaction entry) with the proper cut point from
+// the full context.
+```
+
+## 教训
+
+### 修改外部逻辑时，必须检查被调用函数的内部实现
+
+**错误做法**：只看调用点，假设被调用函数不会修改状态。
+
+**正确做法**：
+1. 阅读被调用函数的完整实现
+2. 检查它是否会覆盖我设置的状态
+3. 确保修改不会被内部逻辑覆盖
+
+**典型场景**：
+- 外部设置状态 → 被调用函数内部覆盖
+- 外部计算结果 → 被调用函数重新计算
+- 外部传递参数 → 被调用函数忽略或修改
+
+**检查清单**：
+- [ ] 被调用函数是否修改了我设置的状态？
+- [ ] 被调用函数是否重新计算了我传递的结果？
+- [ ] 是否需要同步修改被调用函数的内部逻辑？
+
 ## 修改文件
 
 | 文件 | 修改内容 |
