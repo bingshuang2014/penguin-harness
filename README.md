@@ -1,3 +1,46 @@
+# PI Compaction 修复补丁 v2
+
+## 修复内容
+
+1. **keep_recent_tokens 生效**：对完整上下文生效（而非仅当前轮 tool outputs）
+2. **Token 估算支持中文**：CJK 感知的 token 估算（不再用 `text.length/4`）
+3. **pendingRecentMessages 不被覆盖**：summarizeContext 内部不再覆盖外部设置的值
+
+## 文件说明
+
+| 文件 | 说明 | 大小 |
+|------|------|------|
+| `compaction-fix-v2-dist.tar.gz` | 编译后的 dist 文件（只有 index.js） | 367K |
+| `compaction-fix-v2-src.tar.gz` | 源码文件 | 74K |
+
+## 应用方法
+
+### 使用 dist 文件
+
+```bash
+cd penguin-harness/packages/core
+tar xzf compaction-fix-v2-dist.tar.gz
+```
+
+### 使用源码文件
+
+```bash
+cd penguin-harness
+tar xzf compaction-fix-v2-src.tar.gz
+npm run build
+```
+
+## 验证
+
+```bash
+cd penguin-harness/packages/core
+npm test -- --run test/compaction.test.ts
+```
+
+所有 56 个 compaction 测试通过（原版 53 个 + 新增 3 个中文测试）。
+
+---
+
 # Penguin Core Fork 改造说明
 
 ## 仓库信息
