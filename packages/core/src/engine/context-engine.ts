@@ -814,12 +814,14 @@ export class ContextEngine {
 
           let pendingToolOutputsForCompaction: OmniMessage[];
           if (useStructuredPrompt && keepRecentTokens > 0 && attemptInput.length > 0) {
-            // Calculate cut point on the full context
             const cutPoint = this.findCutPoint(attemptInput, keepRecentTokens);
             if (cutPoint > 0 && cutPoint < attemptInput.length) {
-              // Only summarize the older messages, keep the recent ones
               pendingToolOutputsForCompaction = attemptInput.slice(0, cutPoint);
               this.pendingRecentMessages = attemptInput.slice(cutPoint);
+            } else if (cutPoint === 0 && attemptInput.length > 1) {
+              const recentCount = Math.min(5, Math.floor(attemptInput.length / 2));
+              pendingToolOutputsForCompaction = attemptInput.slice(0, -recentCount);
+              this.pendingRecentMessages = attemptInput.slice(-recentCount);
             } else {
               pendingToolOutputsForCompaction = attemptInput;
             }
