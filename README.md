@@ -1,5 +1,11 @@
 # Penguin Core Fork 改造说明
 
+## 仓库信息
+
+- **Fork 仓库**：`git@github.com:bingshuang2014/penguin-harness.git`
+- **分支**：`feat/pi-compaction-improvements`
+- **原版仓库**：`https://github.com/Prism-Shadow/penguin-harness.git`
+
 ## 改造目标
 
 基于 penguin-core 原版，修复 PI Compaction（上下文压缩）功能的关键 bug，提升中文场景下的压缩准确性。
@@ -121,14 +127,34 @@ this.pendingRecentMessages = recentToKeep;
 - [ ] 被调用函数是否重新计算了我传递的结果？
 - [ ] 是否需要同步修改被调用函数的内部逻辑？
 
-## 修改文件
+## 与原版的区别
 
-| 文件 | 修改内容 |
-|------|----------|
-| `packages/core/src/agent.ts` | 添加 keepRecentTokens/reserveTokens/updatePrompt 配置读取 |
-| `packages/core/src/engine/context-engine.ts` | 核心修复：keep_recent_tokens + CJK token 估算 |
-| `packages/core/src/state/default-config.ts` | 添加配置项类型定义 |
-| `packages/core/test/compaction.test.ts` | 新增中文测试用例 |
+| 对比项 | 原版 (Prism-Shadow) | 我们的 Fork |
+|--------|---------------------|-------------|
+| **keep_recent_tokens** | 只对当前轮 toolOutputs 生效 | 对完整上下文生效 |
+| **CJK token 估算** | `text.length / 4`（中文低估 75%） | CJK 感知：中文 ~1 token/字符 |
+| **pendingRecentMessages** | summarizeContext 内部覆盖 | 外部设置，内部不再覆盖 |
+| **配置项** | 仅 max_context_length, mode 等基础配置 | 新增 keep_recent_tokens, reserve_tokens, update_prompt |
+| **测试用例** | 53 个 compaction 测试 | 56 个（+3 个中文测试） |
+| **支持语言** | 仅英文场景 | 中英文混合场景优化 |
+
+### 代码差异概览
+
+```
+packages/core/src/engine/context-engine.ts  (~30 行改动)
+├─ Bug 1: 外部计算 cutPoint，传入 summarizeContext
+├─ Bug 2: 新增 estimateTokensFromText() + isCjkCharacter()
+└─ Bug 3: 删除 summarizeContext 内部 pendingRecentMessages 覆盖
+
+packages/core/src/state/default-config.ts  (~6 行)
+└─ 新增 CompactionConfig 接口字段
+
+packages/core/src/agent.ts  (~3 行)
+└─ 读取 keep_recent_tokens/reserve_tokens/update_prompt
+
+packages/core/test/compaction.test.ts  (~50 行)
+└─ 新增 CJK token 估算测试用例
+```
 
 ## 验证
 
