@@ -420,9 +420,9 @@ describe("context compaction", () => {
       status: "failed",
       attempt: 2,
     });
-    // The retry resends the original input (tool results + prompt; here there are no tool results, just the prompt).
+    // The retry resends the same input (full context + prompt; the task boundary fallback now includes attemptInput).
     expect(llm1.calls).toHaveLength(3);
-    expect(payloadTypes(llm1.calls[2]!)).toEqual(["text"]);
+    expect(payloadTypes(llm1.calls[2]!)).toEqual(["text", "text"]);
   });
 
   it("compaction transport retries default to the shared maxReconnects budget", async () => {
@@ -493,8 +493,7 @@ describe("context compaction", () => {
     });
     // 1 turn request + 2 compaction attempts (the failed one, then the retry that succeeds).
     expect(llm1.calls).toHaveLength(3);
-    // The retry resends the same input (tool results + prompt; only the prompt here).
-    expect(payloadTypes(llm1.calls[2]!)).toEqual(["text"]);
+    expect(payloadTypes(llm1.calls[2]!)).toEqual(["text", "text"]);
   });
 
   it("an explicit compactionMaxReconnects overrides the shared maxReconnects budget", async () => {
@@ -616,7 +615,7 @@ describe("context compaction", () => {
     // request); each retry leads with the corrective note, then the prompt — an empty
     // response needs no repair.
     expect(llm1.calls).toHaveLength(6);
-    expect(llm1.calls[1]!.map(textOf)).toEqual(["COMPACT NOW"]);
+    expect(llm1.calls[1]!.map(textOf)).toEqual(["task one", "COMPACT NOW"]);
     for (let i = 2; i <= 5; i += 1) {
       expect(llm1.calls[i]!.map(textOf)).toEqual([SUMMARY_RETRY_GUIDANCE, "COMPACT NOW"]);
     }

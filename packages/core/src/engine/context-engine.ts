@@ -821,11 +821,10 @@ export class ContextEngine {
               pendingToolOutputsForCompaction = attemptInput.slice(0, cutPoint);
               this.pendingRecentMessages = attemptInput.slice(cutPoint);
             } else {
-              // No cut point found - summarize everything (or nothing to summarize)
-              pendingToolOutputsForCompaction = midTask ? turn.toolOutputs : [];
+              pendingToolOutputsForCompaction = attemptInput;
             }
           } else {
-            pendingToolOutputsForCompaction = midTask ? turn.toolOutputs : [];
+            pendingToolOutputsForCompaction = midTask ? turn.toolOutputs : attemptInput;
           }
 
           const result = yield* this.summarizeContext(
