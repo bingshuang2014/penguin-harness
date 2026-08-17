@@ -487,6 +487,8 @@ export class ContextEngine {
   private lastSessionTokens: TokenCounts = emptyTokenCounts();
   /** Summary produced by a Task-boundary compaction: used as the prefix of the next `run` input (merged with the next user Prompt). */
   private pendingSummary: OmniMessage | null = null;
+  /** Recent messages to keep after compaction (past the keepRecentTokens cut point). */
+  private pendingRecentMessages: OmniMessage[] = [];
   /** Bootstrap records still owed to the Trace (written after the first run's input); see ContextEngineDeps.bootstrapRecords. */
   private pendingBootstrapRecords: OmniMessage[] | null = null;
   /**
@@ -803,9 +805,32 @@ export class ContextEngine {
             return;
           }
         } else {
+          // Fix: Apply keep_recent_tokens to the full context (attemptInput), not just tool outputs.
+          // First, calculate the cut point on the full context, then pass only the older messages
+          // to summarizeContext for compression.
+          const settings = this.deps.compaction!;
+          const keepRecentTokens = settings.keepRecentTokens ?? 20000;
+          const useStructuredPrompt = settings.keepRecentTokens != null && settings.keepRecentTokens > 0;
+
+          let pendingToolOutputsForCompaction: OmniMessage[];
+          if (useStructuredPrompt && keepRecentTokens > 0 && attemptInput.length > 0) {
+            // Calculate cut point on the full context
+            const cutPoint = this.findCutPoint(attemptInput, keepRecentTokens);
+            if (cutPoint > 0 && cutPoint < attemptInput.length) {
+              // Only summarize the older messages, keep the recent ones
+              pendingToolOutputsForCompaction = attemptInput.slice(0, cutPoint);
+              this.pendingRecentMessages = attemptInput.slice(cutPoint);
+            } else {
+              // No cut point found - summarize everything (or nothing to summarize)
+              pendingToolOutputsForCompaction = midTask ? turn.toolOutputs : [];
+            }
+          } else {
+            pendingToolOutputsForCompaction = midTask ? turn.toolOutputs : [];
+          }
+
           const result = yield* this.summarizeContext(
             compactionReason,
-            midTask ? turn.toolOutputs : [],
+            pendingToolOutputsForCompaction,
             signal,
           );
           if (result.status === "aborted") {
@@ -832,9 +857,12 @@ export class ContextEngine {
             // the multi-second compaction request and must not be swallowed (no await sits
             // between this check and the return, so the window cannot reopen).
             if (!midTask && this.steeringQueue.length === 0) {
-              // Task boundary: the summary is merged with the next user Prompt as the new
-              // context's first input.
               this.pendingSummary = result.summary!;
+              const recent = this.pendingRecentMessages;
+              this.pendingRecentMessages = [];
+              if (recent.length > 0) {
+                this.pendingCarryOver = [...recent, ...this.pendingCarryOver];
+              }
               return;
             }
             // Mid-Task: the summary itself becomes the new LLM object's first input (this
@@ -845,7 +873,9 @@ export class ContextEngine {
             // delivered right after the summary as standalone [user_steering] user turns.
             await this.write(result.summary!);
             const steering = yield* this.deliverSteering();
-            nextInput = [result.summary!, ...steering];
+            const recent = this.pendingRecentMessages;
+            this.pendingRecentMessages = [];
+            nextInput = [result.summary!, ...recent, ...steering];
             continue;
           }
           // failed: keep the original context and Trace index; the current Task continues and
@@ -1334,7 +1364,10 @@ export class ContextEngine {
     return true;
   }
 
-  /** @internal Estimates token count for a message using chars/4 approximation. */
+  /** @internal Estimates token count for a message. Uses mixed CJK-aware approximation:
+   *  - CJK characters: ~1 token per character
+   *  - Other characters (Latin, etc.): ~4 characters per token
+   */
   estimateTokens(msg: OmniMessage): number {
     let text = "";
     if (msg.type === "model_msg") {
@@ -1354,7 +1387,41 @@ export class ContextEngine {
         text = payload.text ?? "";
       }
     }
-    return Math.ceil(text.length / 4);
+    return this.estimateTokensFromText(text);
+  }
+
+  /** @internal CJK-aware token estimation. */
+  private estimateTokensFromText(text: string): number {
+    if (text.length === 0) return 0;
+    let cjkCount = 0;
+    let otherCount = 0;
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (this.isCjkCharacter(code)) {
+        cjkCount++;
+      } else {
+        otherCount++;
+      }
+    }
+    // CJK characters: ~1 token each, others: ~4 chars per token
+    return Math.ceil(cjkCount + otherCount / 4);
+  }
+
+  /** @internal Checks if a Unicode code point is a CJK character. */
+  private isCjkCharacter(code: number): boolean {
+    return (
+      (code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+      (code >= 0x3400 && code <= 0x4dbf) || // CJK Unified Ideographs Extension A
+      (code >= 0x20000 && code <= 0x2a6df) || // CJK Unified Ideographs Extension B
+      (code >= 0x2a700 && code <= 0x2b73f) || // CJK Unified Ideographs Extension C
+      (code >= 0x2b740 && code <= 0x2b81f) || // CJK Unified Ideographs Extension D
+      (code >= 0x2b820 && code <= 0x2ceaf) || // CJK Unified Ideographs Extension E
+      (code >= 0xf900 && code <= 0xfaff) || // CJK Compatibility Ideographs
+      (code >= 0x2f800 && code <= 0x2fa1f) || // CJK Compatibility Supplement
+      (code >= 0x3040 && code <= 0x309f) || // Hiragana
+      (code >= 0x30a0 && code <= 0x30ff) || // Katakana
+      (code >= 0x31f0 && code <= 0x31ff) // Katakana Phonetic Extensions
+    );
   }
 
   /**
@@ -1562,20 +1629,31 @@ export class ContextEngine {
     const hasPreviousSummary = this.pendingSummary !== null;
     const useStructuredPrompt = settings.keepRecentTokens != null && settings.keepRecentTokens > 0;
 
+    let messagesToSummarize = pendingToolOutputs;
+    let recentToKeep: OmniMessage[] = [];
+    if (useStructuredPrompt && keepRecentTokens > 0 && pendingToolOutputs.length > 0) {
+      const cutPoint = this.findCutPoint(pendingToolOutputs, keepRecentTokens);
+      if (cutPoint > 0 && cutPoint < pendingToolOutputs.length) {
+        messagesToSummarize = pendingToolOutputs.slice(0, cutPoint);
+        recentToKeep = pendingToolOutputs.slice(cutPoint);
+      }
+    }
+    this.pendingRecentMessages = recentToKeep;
+
     let prompt: OmniMessage;
     if (hasPreviousSummary && settings.updatePrompt) {
       const previousSummaryText = extractSummary((this.pendingSummary!.payload as TextPayload).text);
       prompt = userText(
         settings.updatePrompt
           .replace("{previousSummary}", previousSummaryText)
-          .replace("{newMessages}", pendingToolOutputs.length > 0 ? `${pendingToolOutputs.length} pending tool outputs` : "new conversation messages"),
+          .replace("{newMessages}", messagesToSummarize.length > 0 ? `${messagesToSummarize.length} messages` : "new conversation messages"),
       );
     } else if (useStructuredPrompt) {
       prompt = userText(STRUCTURED_SUMMARIZATION_PROMPT);
     } else {
       prompt = userText(settings.prompt);
     }
-    let base = [...pendingToolOutputs, prompt];
+    let base = [...messagesToSummarize, prompt];
     let input = base;
     await this.write(prompt);
 
@@ -1599,6 +1677,7 @@ export class ContextEngine {
     for (;;) {
       if (signal?.aborted) {
         this.stashRepairs(pendingRepairs);
+        this.pendingRecentMessages = [];
         yield* this.emitCompactionEnd(
           reason,
           "summarize",
@@ -1638,6 +1717,11 @@ export class ContextEngine {
           const summary = userText(buildContextSummaryText(summaryText));
           yield* this.emitCompactionEnd(reason, "summarize", "completed", { attempt: attempts });
           await this.startNewContext();
+          const recent = this.pendingRecentMessages;
+          this.pendingRecentMessages = [];
+          if (recent.length > 0) {
+            this.pendingCarryOver = [...recent, ...this.pendingCarryOver];
+          }
           return { status: "completed", summary, committed };
         }
         // Not a summary — one more failed attempt, sharing the reconnect budget below. Tool
@@ -1665,15 +1749,12 @@ export class ContextEngine {
         for (const repair of pendingRepairs) await this.write(repair);
       } else if (attempt.status === "aborted") {
         this.stashRepairs(pendingRepairs);
+        this.pendingRecentMessages = [];
         yield* this.emitCompactionEnd(reason, "summarize", "aborted", { attempt: attempts });
         return { status: "aborted", committed };
       } else if (attempt.status === "auth") {
-        // `auth` is the one status that never retries: credentials don't heal on a ladder.
-        // It folds into `failed` here: the compaction event pair keeps its
-        // completed/failed/aborted set, the original context is kept, and the host learns
-        // about the credential problem from the request's own terminal status (a turn-loop
-        // request will surface it; the compaction request_end is Trace-only).
         this.stashRepairs(pendingRepairs);
+        this.pendingRecentMessages = [];
         yield* this.emitCompactionEnd(reason, "summarize", "failed", {
           attempt: attempts,
           ...(attempt.errorMessage !== undefined ? { errorMessage: attempt.errorMessage } : {}),
@@ -1691,6 +1772,7 @@ export class ContextEngine {
       // backoff wait still happens.
       if (reconnects >= this.compactionMaxReconnects) {
         this.stashRepairs(pendingRepairs);
+        this.pendingRecentMessages = [];
         yield* this.emitCompactionEnd(reason, "summarize", "failed", {
           attempt: attempts,
           ...(lastError !== undefined ? { errorMessage: lastError } : {}),
@@ -1701,6 +1783,7 @@ export class ContextEngine {
       const ok = await this.backoff(reconnects, signal);
       if (!ok) {
         this.stashRepairs(pendingRepairs);
+        this.pendingRecentMessages = [];
         yield* this.emitCompactionEnd(reason, "summarize", "aborted", { attempt: attempts });
         return { status: "aborted", committed };
       }

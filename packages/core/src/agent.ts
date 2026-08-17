@@ -883,6 +883,9 @@ export class Agent {
       maxSessionTurns: compactionConfig?.max_session_turns ?? -1,
       mode: compactionConfig?.mode === "discard" ? "discard" : "summarize",
       prompt: compactionConfig?.prompt ?? DEFAULT_COMPACTION_PROMPT,
+      keepRecentTokens: compactionConfig?.keep_recent_tokens,
+      reserveTokens: compactionConfig?.reserve_tokens,
+      updatePrompt: compactionConfig?.update_prompt,
     };
 
     return { environment, bootstrap, createLLM, createBareLLM, compaction };

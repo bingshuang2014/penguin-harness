@@ -1668,6 +1668,25 @@ describe("PI compaction improvements", () => {
       const msg = tokenUsage({ cache_read: 0, cache_write: 0, output: 0, total: 100 }, { cache_read: 0, cache_write: 0, output: 0, total: 100 });
       expect(engine.estimateTokens(msg)).toBe(0);
     });
+
+    it("estimates CJK characters as ~1 token each", () => {
+      const engine = makeEngine();
+      const msg = userText("你好世界");
+      expect(engine.estimateTokens(msg)).toBe(4);
+    });
+
+    it("estimates mixed CJK and Latin text correctly", () => {
+      const engine = makeEngine();
+      const msg = userText("hello 你好 world 世界");
+      // "hello " = 6 chars -> 2 tokens, "你好" = 2 CJK -> 2 tokens, " world " = 7 chars -> 2 tokens, "世界" = 2 CJK -> 2 tokens
+      expect(engine.estimateTokens(msg)).toBe(8);
+    });
+
+    it("estimates Japanese hiragana/katakana as CJK tokens", () => {
+      const engine = makeEngine();
+      const msg = userText("こんにちは");
+      expect(engine.estimateTokens(msg)).toBe(5);
+    });
   });
 
   describe("findCutPoint", () => {

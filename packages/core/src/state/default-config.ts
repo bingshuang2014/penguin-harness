@@ -108,6 +108,12 @@ export interface CompactionConfig {
   mode?: CompactionMode;
   /** Prompt template for summarize compaction; defaults to the built-in value (editable config, not hardcoded). */
   prompt?: string;
+  /** Recent tokens to preserve (not summarized). Default 20000. Set to 0 to disable. */
+  keep_recent_tokens?: number;
+  /** Tokens to reserve for the LLM response. Default 16384. Set to 0 to disable. */
+  reserve_tokens?: number;
+  /** Update prompt for incremental summarization. When set, merges new info into existing summary. */
+  update_prompt?: string;
 }
 
 /**
