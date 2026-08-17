@@ -1630,15 +1630,10 @@ export class ContextEngine {
     const useStructuredPrompt = settings.keepRecentTokens != null && settings.keepRecentTokens > 0;
 
     let messagesToSummarize = pendingToolOutputs;
-    let recentToKeep: OmniMessage[] = [];
-    if (useStructuredPrompt && keepRecentTokens > 0 && pendingToolOutputs.length > 0) {
-      const cutPoint = this.findCutPoint(pendingToolOutputs, keepRecentTokens);
-      if (cutPoint > 0 && cutPoint < pendingToolOutputs.length) {
-        messagesToSummarize = pendingToolOutputs.slice(0, cutPoint);
-        recentToKeep = pendingToolOutputs.slice(cutPoint);
-      }
-    }
-    this.pendingRecentMessages = recentToKeep;
+    // Fix: Don't overwrite pendingRecentMessages here - it's already correctly set
+    // by the caller (external compaction entry) with the proper cut point from
+    // the full context. The old logic would re-calculate from pendingToolOutputs
+    // (which are only the early messages to summarize) and overwrite the correct value.
 
     let prompt: OmniMessage;
     if (hasPreviousSummary && settings.updatePrompt) {
